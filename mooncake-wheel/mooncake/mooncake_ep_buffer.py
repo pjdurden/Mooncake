@@ -103,6 +103,29 @@ class Buffer:
         self._warned_active_ranks_without_mooncake_backend = False
         self.connect()
 
+    def _ipc_debug_enabled(self) -> bool:
+        return _env_enabled("MOONCAKE_EP_DEBUG_IPC_EXCHANGE")
+
+    def _ipc_debug(self, message: str) -> None:
+        if not self._ipc_debug_enabled():
+            return
+        import warnings
+
+        warnings.warn(
+            f"[Rank {self.rank}] [EP IPC DEBUG] {message}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    @staticmethod
+    def _summarize_handle(handle: Optional[List[int]], max_items: int = 8) -> str:
+        if handle is None:
+            return "None"
+        prefix = ",".join(str(int(v)) for v in handle[:max_items])
+        if len(handle) > max_items:
+            prefix = f"{prefix},..."
+        return f"len={len(handle)} head=[{prefix}]"
+
     def _maca_phase_fence(self, send_event: Optional[Any] = None) -> None:
         if not _USE_MACA:
             return
@@ -256,18 +279,36 @@ class Buffer:
             try:
                 # Exchange opaque IPC-handle payloads on the host side so the
                 # bytes do not depend on Mooncake CUDA collectives.
+                try:
+                    backend = dist.get_backend(self.group)
+                except Exception:
+                    backend = "unknown"
                 local_handle_ints = [int(v) for v in self.runtime.get_ipc_handle()]
+                self._ipc_debug(
+                    "local handle prepared "
+                    f"(backend={backend}, {self._summarize_handle(local_handle_ints)})"
+                )
                 remote_handles: List[Optional[List[int]]] = [None] * self.group_size
                 dist.all_gather_object(remote_handles, local_handle_ints, self.group)
+                self._ipc_debug(
+                    "gathered handles "
+                    + "; ".join(
+                        f"peer{peer}={self._summarize_handle(handle)}"
+                        for peer, handle in enumerate(remote_handles)
+                    )
+                )
                 active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
+                self._ipc_debug(f"active_ranks_mask={active_ranks_mask}")
                 self.runtime.sync_nvlink_ipc_handles(
                     [list(handle) for handle in remote_handles], active_ranks_mask
                 )
+                self._ipc_debug("sync_nvlink_ipc_handles completed")
             except Exception as e:
                 import warnings
 
                 warnings.warn(
-                    f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
+                    f"[Rank {self.rank}] Failed to exchange IPC handles: "
+                    f"{type(e).__name__}: {e}. Falling back.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
