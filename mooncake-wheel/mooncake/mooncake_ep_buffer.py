@@ -254,19 +254,15 @@ class Buffer:
             return
         else:
             try:
-                local_handle_ints = self.runtime.get_ipc_handle()
-                # pybind11 converts std::vector<int32_t> to a list of integers
-                local_handle_tensor = torch.tensor(
-                    local_handle_ints, dtype=torch.int32, device="cuda"
-                )
-                handles = [
-                    torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(handles, local_handle_tensor, self.group)
-                remote_handles = [h.tolist() for h in handles]
+                # Exchange opaque IPC-handle payloads on the host side so the
+                # bytes do not depend on Mooncake CUDA collectives.
+                local_handle_ints = [int(v) for v in self.runtime.get_ipc_handle()]
+                remote_handles: List[Optional[List[int]]] = [None] * self.group_size
+                dist.all_gather_object(remote_handles, local_handle_ints, self.group)
                 active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
-                self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
+                self.runtime.sync_nvlink_ipc_handles(
+                    [list(handle) for handle in remote_handles], active_ranks_mask
+                )
             except Exception as e:
                 import warnings
 
